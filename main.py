@@ -1,9 +1,11 @@
 from __future__ import annotations
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
+import asyncio
+import random
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query
+
+from fastapi import FastAPI, HTTPException, Depends, Header
+from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="TechStar Group - Supply Chain Status API",
@@ -59,6 +61,19 @@ MOCK_CARRIERS: dict[str, dict] = {
     },
 }
 
+VALID_API_KEYS = {"techstar-fde-key-001", "techstar-fde-key-002"}
+
+
+def verify_api_key(x_api_key: Optional[str] = Header(default=None)) -> str:
+
+    if x_api_key is None:
+        raise HTTPException(status_code=401, detail="Missing API key")
+
+    if x_api_key not in VALID_API_KEYS:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+    return x_api_key
+
 
 class ShipmentResponse(BaseModel):
     shipment_id: str
@@ -93,7 +108,7 @@ def home():
     "/shipments/{shipment_id}",
     response_model=ShipmentResponse,
 )
-def get_shipment(shipment_id: str) -> dict:
+def get_shipment(shipment_id: str, api_key: str = Depends(verify_api_key)) -> dict:
     if shipment_id not in MOCK_SHIPMENTS:
         raise HTTPException(
             status_code=404,
@@ -108,11 +123,15 @@ def get_carrier(carrier_code: str):
     return MOCK_CARRIERS[carrier_code]
 
 
-@app.get("/shipments", response_model=list[ShipmentResponse])
+@app.get(
+    "/shipments",
+    response_model=list[ShipmentResponse],
+)
 def list_shipments(
     status: Optional[str] = None,
     carrier: Optional[str] = None,
-) -> list[dict]:
+    api_key: str = Depends(verify_api_key),
+):
     """
     GET /shipments
     GET /shipments?status=delayed
@@ -129,6 +148,7 @@ def list_shipments(
 
     return shipments
 
+
 @app.post(
     "/shipments",
     response_model=ShipmentResponse,
@@ -136,6 +156,7 @@ def list_shipments(
 )
 def create_shipment(
     payload: ShipmentCreateRequest,
+    api_key: str = Depends(verify_api_key),
 ) -> dict:
 
     if payload.shipment_id in MOCK_SHIPMENTS:
@@ -163,9 +184,105 @@ def create_shipment(
     "/carriers",
     response_model=list[CarrierResponse],
 )
-def list_carriers() -> list[dict]:
-    """
-    GET /carriers
-    """
+def list_carriers(
+    api_key: str = Depends(verify_api_key),
+) -> list[dict]:
+    """GET /carriers"""
 
     return list(MOCK_CARRIERS.values())
+
+
+async def call_vendor_a(shipment_id: str) -> dict:
+    await asyncio.sleep(0.1)
+    return {"id": shipment_id, "current_status": "in_transit", "eta_days": 2}
+
+
+async def call_vendor_b(shipment_id: str) -> dict:
+    await asyncio.sleep(0.15)
+
+    if random.random() < 0.3:
+        raise ConnectionError("Vendor B timeout")
+
+    return {"shipmentRef": shipment_id, "trackingState": "DELAYED", "delayHrs": 36}
+
+
+async def call_vendor_c(shipment_id: str) -> dict:
+    await asyncio.sleep(0.08)
+
+    return {
+        "shipment": {"identifier": shipment_id},
+        "state": {"code": "DELIVERED", "confidence": 0.95},
+    }
+
+
+class VendorStatus(BaseModel):
+    shipment_id: str
+    source_vendor: str
+    normalised_status: str
+    raw: dict
+
+
+def normalise_vendor_a(raw: dict) -> VendorStatus:
+    return VendorStatus(
+        shipment_id=raw["id"],
+        source_vendor="vendor_a",
+        normalised_status=raw.get("current_status", "unknown"),
+        raw=raw,
+    )
+
+
+def normalise_vendor_b(raw: dict) -> VendorStatus:
+
+    status_map = {
+        "IN_TRANSIT": "in_transit",
+        "DELAYED": "delayed",
+        "DELIVERED": "delivered",
+    }
+
+    return VendorStatus(
+        shipment_id=raw["shipmentRef"],
+        source_vendor="vendor_b",
+        normalised_status=status_map.get(raw["trackingState"], "unknown"),
+        raw=raw,
+    )
+
+
+def normalise_vendor_c(raw: dict) -> VendorStatus:
+
+    code = raw.get("state", {}).get("code", "").lower()
+
+    return VendorStatus(
+        shipment_id=raw["shipment"]["identifier"],
+        source_vendor="vendor_c",
+        normalised_status=code,
+        raw=raw,
+    )
+
+
+@app.get("/supply-chain-status/{shipment_id}", response_model=list[VendorStatus])
+async def get_supply_chain_status(
+    shipment_id: str,
+    api_key: str = Depends(verify_api_key),
+) -> list[VendorStatus]:
+    vendor_calls = [
+        call_vendor_a(shipment_id),
+        call_vendor_b(shipment_id),
+        call_vendor_c(shipment_id),
+    ]
+
+    results = await asyncio.gather(*vendor_calls, return_exceptions=True)
+
+    normalisers = [normalise_vendor_a, normalise_vendor_b, normalise_vendor_c]
+
+    final_results: list[VendorStatus] = []
+
+    for raw, normaliser in zip(results, normalisers):
+        if isinstance(raw, Exception):
+            continue
+
+        final_results.append(normaliser(raw))
+
+    if not final_results:
+        raise HTTPException(status_code=503, detail="All vendor systems unreachable")
+
+    return final_results
